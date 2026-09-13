@@ -11,14 +11,15 @@ import urllib.error
 import uuid
 from datetime import datetime, timezone
 from engine import analyze, next_event, report_text, select, utc, POSITIONS
-from card import render
+from card import render, welcome
+from ui import Interface, h, home_button
 
 LOG = logging.getLogger('radar')
 FPL = 'https://fantasy.premierleague.com/api/'
 
 class RemoteError(Exception):
-    def __init__(self, code=0, retry_after=5):
-        self.code=code; self.retry_after=retry_after
+    def __init__(self, code=0, retry_after=5, not_modified=False):
+        self.code=code; self.retry_after=retry_after; self.not_modified=not_modified
         super().__init__(f'Remote request failed ({code})')  # Never log token-bearing URLs.
 
 def request_json(url, payload=None, timeout=25, headers=None):
@@ -28,10 +29,13 @@ def request_json(url, payload=None, timeout=25, headers=None):
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as e:
-        retry=5
-        try: retry=int(json.loads(e.read()).get('parameters',{}).get('retry_after',5))
+        retry=5; not_modified=False
+        try:
+            detail=json.loads(e.read())
+            retry=int(detail.get('parameters',{}).get('retry_after',5))
+            not_modified='message is not modified' in detail.get('description','').lower()
         except (ValueError,TypeError): pass
-        raise RemoteError(e.code,retry) from None
+        raise RemoteError(e.code,retry,not_modified) from None
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         raise RemoteError() from None
 
@@ -118,7 +122,7 @@ KEYBOARD={'keyboard':[['/gw','/card'],['/captain','/budget'],['/differentials','
 class Bot:
     def __init__(self,token,store,source):
         self.url='https://api.telegram.org/bot'+token+'/'
-        self.store=store;self.source=source;self.last={}
+        self.store=store;self.source=source;self.last={};self.ui=Interface(self)
         self.allowed={int(x) for x in os.getenv('ALLOWED_USER_IDS','').split(',') if x.strip()}
     def api(self,method,payload=None):
         result=request_json(self.url+method,payload,timeout=40)
@@ -136,75 +140,75 @@ class Bot:
             payload={'chat_id':chat,'text':part}
             if keyboard: payload['reply_markup']=KEYBOARD
             self.api('sendMessage',payload)
-    def photo(self,chat,r):
+    def send_image(self,chat,data,caption,keyboard):
         boundary=uuid.uuid4().hex
-        data=render(r)
-        body=(f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat}\r\n'
-              f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="radar.png"\r\nContent-Type: image/png\r\n\r\n').encode()+data+f'\r\n--{boundary}--\r\n'.encode()
+        fields={'chat_id':str(chat),'caption':caption,'parse_mode':'HTML','reply_markup':json.dumps({'inline_keyboard':keyboard},ensure_ascii=False)}
+        body=b''
+        for key,value in fields.items():
+            body+=(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n').encode()
+        body+=(f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="radar.png"\r\nContent-Type: image/png\r\n\r\n').encode()+data+f'\r\n--{boundary}--\r\n'.encode()
         req=urllib.request.Request(self.url+'sendPhoto',data=body,headers={'Content-Type':f'multipart/form-data; boundary={boundary}'})
         try:
-            with urllib.request.urlopen(req,timeout=40) as response:
-                result=json.load(response)
-            if not result.get('ok'): raise RemoteError(result.get('error_code',0))
-        except urllib.error.HTTPError as e: raise RemoteError(e.code) from None
-        except (urllib.error.URLError,TimeoutError,OSError,ValueError): raise RemoteError() from None
+            with urllib.request.urlopen(req,timeout=40) as response:result=json.load(response)
+            if not result.get('ok'):raise RemoteError(result.get('error_code',0))
+            return result.get('result')
+        except urllib.error.HTTPError as e:raise RemoteError(e.code) from None
+        except (urllib.error.URLError,TimeoutError,OSError,ValueError):raise RemoteError() from None
+    def photo(self,chat,r):
+        from ui import button
+        return self.send_image(chat,render(r),f"📡 <b>راداراتي · الجولة {r['event']['id']}</b>\nبطاقتك للمشاركة · مؤشر مقارن، وليس نقاطًا متوقعة.",[[button('🏟 استكشف اللاعبين',f"ui:overview:{r['event']['id']}"),home_button()]])
     def report(self,gw=None):
         r=self.source.report(gw)
         b,_,_=self.source.load();season=b['events'][0]['deadline_time'][:4]
         self.store.archive(r,season)
         return r
     def handle(self,update):
-        msg=update.get('message',{}); chat=msg.get('chat',{}).get('id')
-        # Private only: subscriptions cannot be activated on behalf of a group.
-        if not chat or msg.get('chat',{}).get('type')!='private': return
-        if self.allowed and msg.get('from',{}).get('id') not in self.allowed: return
-        raw=msg.get('text','').split()
-        if not raw: return
-        if time.monotonic()-self.last.get(chat,0)<2: return
+        callback=update.get('callback_query')
+        msg=callback.get('message',{}) if callback else update.get('message',{})
+        chat=msg.get('chat',{}).get('id')
+        if not chat or msg.get('chat',{}).get('type')!='private':return
+        actor=(callback or msg).get('from',{}).get('id')
+        if self.allowed and actor not in self.allowed:return
+        if callback:
+            # Acknowledge before data fetching so Telegram stops its spinner.
+            self.api('answerCallbackQuery',{'callback_query_id':callback['id']})
+        if time.monotonic()-self.last.get(chat,0)<.7:return
         self.last[chat]=time.monotonic()
-        if len(self.last)>10000: self.last={chat:self.last[chat]}
-        cmd=raw[0].split('@')[0].lower()
+        if len(self.last)>10000:self.last={chat:self.last[chat]}
+        mid=msg.get('message_id') if callback and msg.get('text') else None
         try:
-            if cmd in ('/start','/help'): return self.say(chat,HELP,True)
-            if cmd=='/method': return self.say(chat,METHOD)
-            if cmd=='/subscribe':
-                self.store.subscribe(chat);return self.say(chat,'تم تفعيل تنبيهات الجولة قبل الإغلاق بـ24 ساعة وساعة. /stop للإيقاف.')
-            if cmd in ('/stop','/delete'):
-                self.store.stop(chat)
-                if cmd=='/delete':
-                    self.store.db.execute('DELETE FROM sent WHERE chat=?',(chat,));self.store.db.commit();self.last.pop(chat,None)
-                return self.say(chat,'تم إيقاف التنبيهات.' if cmd=='/stop' else 'تم حذف بيانات اشتراكك وسجل تنبيهاتك.')
-            if cmd=='/history':
-                row=self.store.db.execute('SELECT payload FROM reports ORDER BY season DESC,gw DESC LIMIT 1').fetchone()
-                return self.say(chat,'📁 تقرير محفوظ؛ بياناته تعود إلى الوقت الموضح أدناه.\n'+report_text(json.loads(row[0])) if row else 'لا يوجد تقرير محفوظ بعد.')
-            if cmd not in ('/gw','/picks','/captain','/budget','/differentials','/fixtures','/card'):
-                return self.say(chat,HELP,True)
-            gw=None;pos=None;price=None
-            if cmd=='/gw' and len(raw)>1:
-                try: gw=int(raw[1])
-                except ValueError: raise ValueError('مثال: /gw 6')
+            if callback:
+                data=callback.get('data','')
+                if not data.startswith('ui:') or len(data.encode())>64:raise ValueError('اختيار غير صالح.')
+                return self.ui.dispatch(chat,data,mid)
+            raw=msg.get('text','').split()
+            if not raw:return
+            cmd=raw[0].split('@')[0].lower()
+            if cmd=='/start':
+                self.api('sendMessage',{'chat_id':chat,'text':'📡 مرحبًا بك في راداراتي — اختر من القائمة أدناه.','reply_markup':{'remove_keyboard':True}})
+                return self.ui.home(chat,with_banner=True)
+            if cmd in ('/help','/menu'):return self.ui.home(chat)
+            if cmd=='/gw':return self.ui.overview(chat,int(raw[1]) if len(raw)>1 else 0)
+            if cmd in ('/captain','/budget','/differentials'):return self.ui.listing(chat,cmd[1:])
             if cmd=='/picks':
-                if len(raw)!=3: raise ValueError('مثال: /picks MID 7.5 — المراكز GK DEF MID FWD')
+                if len(raw)==1:return self.ui.listing(chat)
+                if len(raw)!=3:raise ValueError('مثال: /picks MID 7.5')
                 pos={'GK':1,'DEF':2,'MID':3,'FWD':4}.get(raw[1].upper())
-                try: price=float(raw[2])
-                except ValueError: raise ValueError('السعر رقم مثل 7.5')
-                if not pos or not 0<price<=25: raise ValueError('أدخل مركزًا صالحًا وسعرًا بين 0 و25.')
-            r=self.report(gw)
-            if cmd=='/card': return self.photo(chat,r)
-            if cmd=='/fixtures':
-                lines=['🗓 نظرة على 3 جولات · الصعوبة من 1 (سهل) إلى 5 (صعب)']
-                for position,label in POSITIONS.items():
-                    lines.append('\n'+label)
-                    for p in select(r,pos=position)[:2]:
-                        lines.append(f"{p['name']} · £{p['price']:.1f}m")
-                        for outlook in p['outlook']:
-                            desc=' + '.join(f"{g['opponent']} ({'H' if g['home'] else 'A'}) {g['difficulty']:g}/5" for g in outlook['games']) or 'بلا مباراة مجدولة'
-                            lines.append(f"GW{outlook['gw']}: {desc}")
-                lines.append('H أرضه، A خارج أرضه. المواعيد عرضة للتعديل.')
-                return self.say(chat,'\n'.join(lines))
-            return self.say(chat,report_text(r,'gw' if cmd=='/picks' else cmd[1:],pos,price))
-        except ValueError as e: self.say(chat,str(e))
-        except RemoteError: self.say(chat,'تعذر تحديث البيانات الآن. حاول لاحقًا؛ لن أعرض بيانات قديمة باعتبارها حديثة.')
+                price=float(raw[2])
+                if not pos or not 0<price<=25:raise ValueError('اختر GK أو DEF أو MID أو FWD وسعرًا حتى 25.')
+                return self.ui.listing(chat,pos=pos,price=price)
+            if cmd in ('/subscribe','/stop','/history','/method'):return self.ui.dispatch(chat,'ui:'+cmd[1:])
+            if cmd=='/card':return self.ui.dispatch(chat,'ui:card:0')
+            if cmd=='/fixtures':return self.ui.fixtures(chat)
+            if cmd=='/delete':
+                self.store.stop(chat)
+                self.store.db.execute('DELETE FROM sent WHERE chat=?',(chat,));self.store.db.commit();self.last.pop(chat,None)
+                return self.ui.show(chat,'تم حذف بيانات اشتراكك وسجل تنبيهاتك.',[[home_button()]])
+            return self.ui.home(chat)
+        except (ValueError,IndexError):
+            return self.ui.show(chat,'<b>تعذر فتح هذا الاختيار</b>\nربما أغلقت الجولة أو تغيّرت حالة اللاعب. افتح الرئيسية لاختيار تقرير جديد.\nللبحث: <code>/picks MID 7.5</code>',[[home_button()]],mid)
+        except RemoteError:
+            return self.ui.show(chat,'<b>☁️ تعذر الاتصال مؤقتًا</b>\nحاول بعد قليل. يمكنك الرجوع للأرشيف لمشاهدة تقرير محفوظ مع تاريخه.',[[home_button()]],mid)
     def schedule(self):
         if not self.store.db.execute('SELECT 1 FROM chats LIMIT 1').fetchone(): return
         b,_,_=self.source.load();now=datetime.now(timezone.utc);e=next_event(b,now)
@@ -220,7 +224,7 @@ class Bot:
             try:
                 if r is None:r=self.report()
                 prefix='⏰ نافذة التقرير قبل الإغلاق بـ24 ساعة\n' if kind=='24h' else '⏰ أقل من ساعة على إغلاق الجولة؛ راجع التشكيل\n'
-                self.say(chat,prefix+report_text(r,'gw' if kind=='24h' else 'captain'))
+                self.say(chat,prefix+self.ui.digest(r,kind))
                 self.store.db.execute('INSERT OR IGNORE INTO sent VALUES(?,?,?,?)',(chat,season,e['id'],kind));self.store.db.commit()
                 time.sleep(.15)
             except RemoteError as err:
@@ -233,10 +237,10 @@ class Bot:
             raise ValueError('هناك Webhook مفعّل لهذا التوكن. أوقفه قبل تشغيل نسخة polling.')
         self.api('setMyCommands',{'commands':[{'command':c,'description':d} for c,d in [('gw','تقرير الجولة'),('card','بطاقة الجولة'),('picks','بحث بالمركز والسعر'),('captain','مرشحو الكابتن'),('budget','خيارات اقتصادية'),('differentials','قليلو الملكية'),('fixtures','المباريات القادمة'),('subscribe','تفعيل التنبيهات'),('stop','إيقاف التنبيهات'),('history','تقرير محفوظ'),('method','منهجية التحليل'),('help','المساعدة'),('delete','حذف بياناتي')]]})
         tick=0
-        LOG.info('Bot running')
+        LOG.info('Bot running | RADARATI UI 2.0')
         while True:
             try:
-                updates=self.api('getUpdates',{'offset':int(self.store.get('offset')),'timeout':20,'allowed_updates':['message']})
+                updates=self.api('getUpdates',{'offset':int(self.store.get('offset')),'timeout':20,'allowed_updates':['message','callback_query']})
                 for u in updates:
                     try:self.handle(u)
                     except Exception:LOG.warning('Command failed (details suppressed to protect credentials)')
