@@ -1,0 +1,12 @@
+services:
+  radar:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - radar-data:/app/data
+    init: true
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  radar-data:
